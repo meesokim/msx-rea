@@ -1,0 +1,13 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+*.bak
+*.backup
+*.backup.recovery
+.DS_Store
+/tmp/
+evidence.json
+report.md
+disasm_main.asm

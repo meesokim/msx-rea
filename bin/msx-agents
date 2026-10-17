@@ -1,0 +1,541 @@
+#!/usr/bin/env python3
+"""msx-agents — multi-LLM setup for analyze-msx-media (REA-style)."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sys
+from pathlib import Path
+from typing import Any
+
+ROOT = Path(__file__).resolve().parent.parent
+SKILL_NAME = "analyze-msx-media"
+SKILL_SRC = ROOT / "skill" / SKILL_NAME
+TRIAGE = SKILL_SRC / "scripts" / "msx_triage.py"
+MCP_SERVER = ROOT / "lib" / "msx_mcp_server.py"
+
+# (id, display, detect_marker, skill_dir, mcp_kind, mcp_path)
+CLIENTS: list[dict[str, Any]] = [
+    {
+        "id": "universal",
+        "label": "Universal (.agents)",
+        "marker": Path.home() / ".agents",
+        "skill_dir": Path.home() / ".agents" / "skills",
+        "always": True,
+        "mcp": None,
+    },
+    {
+        "id": "cursor",
+        "label": "Cursor",
+        "marker": Path.home() / ".cursor",
+        "skill_dir": Path.home() / ".cursor" / "skills",
+        "mcp": ("json", Path.home() / ".cursor" / "mcp.json"),
+    },
+    {
+        "id": "claude_code",
+        "label": "Claude Code",
+        "marker": Path.home() / ".claude",
+        "skill_dir": Path.home() / ".claude" / "skills",
+        "mcp": ("claude_json", Path.home() / ".claude.json"),
+    },
+    {
+        "id": "claude_desktop",
+        "label": "Claude Desktop",
+        "marker": Path.home() / ".config" / "Claude",
+        "skill_dir": None,
+        "mcp": (
+            "json",
+            Path.home() / ".config" / "Claude" / "claude_desktop_config.json",
+        ),
+    },
+    {
+        "id": "codex",
+        "label": "Codex",
+        "marker": Path.home() / ".codex",
+        "skill_dir": Path.home() / ".codex" / "skills",
+        "mcp": ("codex_toml", Path.home() / ".codex" / "config.toml"),
+    },
+    {
+        "id": "gemini_cli",
+        "label": "Gemini CLI",
+        "marker": Path.home() / ".gemini",
+        "skill_dir": Path.home() / ".gemini" / "skills",
+        "mcp": ("gemini_json", Path.home() / ".gemini" / "settings.json"),
+    },
+    {
+        "id": "antigravity",
+        "label": "Antigravity",
+        "marker": Path.home() / ".gemini" / "config",
+        "skill_dir": None,
+        "mcp": ("json", Path.home() / ".gemini" / "config" / "mcp_config.json"),
+    },
+    {
+        "id": "opencode",
+        "label": "OpenCode",
+        "marker": Path.home() / ".config" / "opencode",
+        "skill_dir": Path.home() / ".config" / "opencode" / "skills",
+        "mcp": ("opencode_json", Path.home() / ".config" / "opencode" / "opencode.json"),
+    },
+    {
+        "id": "copilot",
+        "label": "GitHub Copilot",
+        "marker": Path.home() / ".copilot",
+        "skill_dir": Path.home() / ".copilot" / "skills",
+        "mcp": ("copilot_json", Path.home() / ".copilot" / "mcp-config.json"),
+    },
+    {
+        "id": "windsurf",
+        "label": "Windsurf",
+        "marker": Path.home() / ".codeium" / "windsurf",
+        "skill_dir": Path.home() / ".codeium" / "windsurf" / "skills",
+        "mcp": (
+            "json",
+            Path.home() / ".codeium" / "windsurf" / "mcp_config.json",
+        ),
+    },
+    {
+        "id": "factory",
+        "label": "Factory Droid",
+        "marker": Path.home() / ".factory",
+        "skill_dir": Path.home() / ".factory" / "skills",
+        "mcp": ("json", Path.home() / ".factory" / "mcp.json"),
+    },
+]
+
+MCP_SERVER_KEY = "msx-agents"
+
+
+def _python() -> str:
+    return sys.executable
+
+
+def mcp_launch() -> dict[str, Any]:
+    """Command block written into client MCP configs."""
+    path_parts = [
+        str(Path.home() / ".nvm" / "versions" / "node" / "v24.22.0" / "bin"),
+        "/usr/local/bin",
+        "/usr/bin",
+        "/bin",
+        str(Path.home() / ".local" / "bin"),
+    ]
+    # Keep existing nvm node if present
+    nvm = Path.home() / ".nvm" / "versions" / "node"
+    if nvm.is_dir():
+        versions = sorted(nvm.iterdir(), reverse=True)
+        if versions:
+            path_parts.insert(0, str(versions[0] / "bin"))
+    return {
+        "command": _python(),
+        "args": [str(MCP_SERVER)],
+        "env": {
+            "PATH": ":".join(path_parts),
+            "MSX_AGENTS_ROOT": str(ROOT),
+        },
+    }
+
+
+def detected_clients() -> list[dict[str, Any]]:
+    out = []
+    for c in CLIENTS:
+        if c.get("always") or (c["marker"] and Path(c["marker"]).exists()):
+            out.append(c)
+    return out
+
+
+def install_skill(skill_dir: Path, *, dry_run: bool) -> dict[str, Any]:
+    if skill_dir is None:
+        return {"status": "skipped", "reason": "no skill dir"}
+    dest = skill_dir / SKILL_NAME
+    action = {
+        "target": str(dest),
+        "source": str(SKILL_SRC),
+        "operation": "symlink",
+    }
+    if dry_run:
+        action["status"] = "planned"
+        return action
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    if dest.is_symlink() or dest.exists():
+        if dest.is_symlink() or dest.is_dir():
+            if dest.is_symlink():
+                dest.unlink()
+            elif dest.resolve() != SKILL_SRC.resolve():
+                # Replace non-canonical copy with symlink
+                shutil.rmtree(dest)
+            else:
+                action["status"] = "already"
+                return action
+    dest.symlink_to(SKILL_SRC, target_is_directory=True)
+    action["status"] = "installed"
+    return action
+
+
+def _backup(path: Path) -> Path | None:
+    if not path.exists():
+        return None
+    bak = path.with_name(path.name + ".msx-agents.backup")
+    if not bak.exists():
+        shutil.copy2(path, bak)
+        return bak
+    # keep first backup; write recovery
+    rec = path.with_name(path.name + ".msx-agents.backup.recovery")
+    shutil.copy2(path, rec)
+    return rec
+
+
+def _write_json(path: Path, data: dict) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(data, indent=2, ensure_ascii=False) + "\n", encoding="utf-8")
+
+
+def register_mcp_json(path: Path, *, dry_run: bool, servers_key: str = "mcpServers") -> dict[str, Any]:
+    launch = mcp_launch()
+    info: dict[str, Any] = {"path": str(path), "key": MCP_SERVER_KEY, "servers_key": servers_key}
+    if dry_run:
+        info["status"] = "planned"
+        info["launch"] = launch
+        return info
+    data: dict[str, Any] = {}
+    if path.exists():
+        _backup(path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            info["status"] = "failed"
+            info["error"] = "malformed JSON"
+            return info
+    servers = data.setdefault(servers_key, {})
+    if not isinstance(servers, dict):
+        info["status"] = "failed"
+        info["error"] = f"{servers_key} is not an object"
+        return info
+    # Preserve unrelated env overrides if same server exists
+    prev = servers.get(MCP_SERVER_KEY) or {}
+    entry = dict(launch)
+    if isinstance(prev, dict) and isinstance(prev.get("env"), dict):
+        merged = dict(prev["env"])
+        merged.update(entry.get("env") or {})
+        entry["env"] = merged
+    servers[MCP_SERVER_KEY] = entry
+    _write_json(path, data)
+    info["status"] = "configured"
+    return info
+
+
+def register_mcp_claude_json(path: Path, *, dry_run: bool) -> dict[str, Any]:
+    """Claude Code user config may nest mcpServers at top level."""
+    return register_mcp_json(path, dry_run=dry_run, servers_key="mcpServers")
+
+
+def register_mcp_gemini(path: Path, *, dry_run: bool) -> dict[str, Any]:
+    return register_mcp_json(path, dry_run=dry_run, servers_key="mcpServers")
+
+
+def register_mcp_opencode(path: Path, *, dry_run: bool) -> dict[str, Any]:
+    # OpenCode uses mcp section; keep json mcpServers-compatible if present
+    launch = mcp_launch()
+    info: dict[str, Any] = {"path": str(path), "key": MCP_SERVER_KEY}
+    if dry_run:
+        info["status"] = "planned"
+        return info
+    data: dict[str, Any] = {}
+    if path.exists():
+        _backup(path)
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            info["status"] = "failed"
+            info["error"] = "malformed JSON"
+            return info
+    mcp = data.setdefault("mcp", {})
+    if not isinstance(mcp, dict):
+        mcp = {}
+        data["mcp"] = mcp
+    mcp[MCP_SERVER_KEY] = {
+        "type": "local",
+        "command": [launch["command"], *launch["args"]],
+        "enabled": True,
+        "environment": launch.get("env") or {},
+    }
+    # Also mirror classic mcpServers for clients that read it
+    servers = data.setdefault("mcpServers", {})
+    if isinstance(servers, dict):
+        servers[MCP_SERVER_KEY] = launch
+    _write_json(path, data)
+    info["status"] = "configured"
+    return info
+
+
+def register_mcp_copilot(path: Path, *, dry_run: bool) -> dict[str, Any]:
+    return register_mcp_json(path, dry_run=dry_run, servers_key="mcpServers")
+
+
+def register_mcp_codex(path: Path, *, dry_run: bool) -> dict[str, Any]:
+    """Append/update [mcp_servers.msx-agents] in Codex config.toml."""
+    import re
+
+    launch = mcp_launch()
+    info: dict[str, Any] = {"path": str(path), "key": MCP_SERVER_KEY}
+    if dry_run:
+        info["status"] = "planned"
+        return info
+    path.parent.mkdir(parents=True, exist_ok=True)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    if path.exists():
+        _backup(path)
+    section = f"[mcp_servers.{MCP_SERVER_KEY}]"
+    block = (
+        f"{section}\n"
+        f'command = "{launch["command"]}"\n'
+        f"args = {json.dumps(launch['args'])}\n"
+    )
+    env = launch.get("env") or {}
+    if env:
+        env_items = ", ".join(f'"{k}" = "{v}"' for k, v in env.items())
+        block += f"env = {{ {env_items} }}\n"
+    block += "\n"
+
+    pattern = re.compile(
+        rf"^\[mcp_servers\.{re.escape(MCP_SERVER_KEY)}\][^\[]*",
+        re.MULTILINE,
+    )
+    if pattern.search(text):
+        text = pattern.sub(block, text, count=1)
+    else:
+        if text and not text.endswith("\n"):
+            text += "\n"
+        text = text + "\n" + block
+    path.write_text(text, encoding="utf-8")
+    info["status"] = "configured"
+    return info
+
+def apply_mcp(kind: str, path: Path, *, dry_run: bool) -> dict[str, Any]:
+    if kind == "json":
+        return register_mcp_json(path, dry_run=dry_run)
+    if kind == "claude_json":
+        return register_mcp_claude_json(path, dry_run=dry_run)
+    if kind == "gemini_json":
+        return register_mcp_gemini(path, dry_run=dry_run)
+    if kind == "opencode_json":
+        return register_mcp_opencode(path, dry_run=dry_run)
+    if kind == "copilot_json":
+        return register_mcp_copilot(path, dry_run=dry_run)
+    if kind == "codex_toml":
+        return register_mcp_codex(path, dry_run=dry_run)
+    return {"status": "skipped", "reason": f"unknown mcp kind {kind}"}
+
+
+def cmd_setup(args: argparse.Namespace) -> int:
+    if not SKILL_SRC.is_dir() or not (SKILL_SRC / "SKILL.md").is_file():
+        print(f"error: skill missing at {SKILL_SRC}", file=sys.stderr)
+        return 2
+
+    selected = detected_clients() if args.all_detected else []
+    if args.client:
+        by_id = {c["id"]: c for c in CLIENTS}
+        selected = []
+        for cid in args.client:
+            if cid not in by_id:
+                print(f"error: unknown client {cid}", file=sys.stderr)
+                print("known:", ", ".join(c["id"] for c in CLIENTS), file=sys.stderr)
+                return 2
+            selected.append(by_id[cid])
+        # always include universal when configuring any client
+        uni = next(c for c in CLIENTS if c["id"] == "universal")
+        if uni not in selected:
+            selected = [uni, *selected]
+    if not selected:
+        # default interactive-equivalent: universal + all detected
+        selected = detected_clients()
+
+    plan: dict[str, Any] = {
+        "status": "planned" if args.dry_run else "ready",
+        "skill_source": str(SKILL_SRC),
+        "mcp_server": str(MCP_SERVER),
+        "clients": [],
+        "applied": [],
+    }
+
+    for c in selected:
+        entry: dict[str, Any] = {
+            "id": c["id"],
+            "label": c["label"],
+            "detected": bool(c.get("always") or (c["marker"] and Path(c["marker"]).exists())),
+        }
+        if c.get("skill_dir"):
+            entry["skill"] = install_skill(Path(c["skill_dir"]), dry_run=args.dry_run)
+        if c.get("mcp") and not args.skill_only:
+            kind, path = c["mcp"]
+            # Only write MCP if marker exists or client explicitly requested
+            explicit = bool(args.client) or args.all_detected
+            if Path(c["marker"]).exists() or c.get("always") or (args.client and c["id"] in (args.client or [])):
+                if path and (path.exists() or explicit):
+                    entry["mcp"] = apply_mcp(kind, Path(path), dry_run=args.dry_run)
+                else:
+                    entry["mcp"] = {"status": "skipped", "reason": "config path absent"}
+        plan["clients"].append(entry)
+        if not args.dry_run:
+            plan["applied"].append(c["id"])
+
+    # Ensure ~/.local/bin/msx-agents on PATH tip
+    local_bin = Path.home() / ".local" / "bin"
+    local_bin.mkdir(parents=True, exist_ok=True)
+    link = local_bin / "msx-agents"
+    self_path = Path(__file__).resolve()
+    if not args.dry_run:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(self_path)
+
+    print(json.dumps(plan, indent=2, ensure_ascii=False))
+    if not args.dry_run:
+        print(
+            "\nRestart Cursor / Claude / Codex / Gemini sessions to load MCP + skills.",
+            file=sys.stderr,
+        )
+    return 0
+
+
+def cmd_doctor(_: argparse.Namespace) -> int:
+    tools = {
+        "python": sys.version.split()[0],
+        "msx_triage": "ok" if TRIAGE.is_file() else "missing",
+        "mcp_server": "ok" if MCP_SERVER.is_file() else "missing",
+        "skill": "ok" if (SKILL_SRC / "SKILL.md").is_file() else "missing",
+        "z80dasm": "ok" if shutil.which("z80dasm") else "missing",
+        "openmsx": "ok" if shutil.which("openmsx") else "missing",
+        "msxforge": "ok" if shutil.which("msxforge") else "missing",
+        "java": "ok" if shutil.which("java") else "missing",
+    }
+    skill_links = []
+    for c in CLIENTS:
+        if not c.get("skill_dir"):
+            continue
+        dest = Path(c["skill_dir"]) / SKILL_NAME
+        skill_links.append(
+            {
+                "client": c["id"],
+                "path": str(dest),
+                "present": dest.exists() or dest.is_symlink(),
+                "is_symlink": dest.is_symlink(),
+                "resolved": str(dest.resolve()) if dest.exists() or dest.is_symlink() else None,
+            }
+        )
+    mcp_regs = []
+    for c in CLIENTS:
+        if not c.get("mcp"):
+            continue
+        kind, path = c["mcp"]
+        present = Path(path).exists()
+        has = False
+        if present and kind in ("json", "claude_json", "gemini_json", "copilot_json", "opencode_json"):
+            try:
+                data = json.loads(Path(path).read_text(encoding="utf-8"))
+                servers = data.get("mcpServers") or data.get("mcp") or {}
+                has = MCP_SERVER_KEY in servers
+            except Exception:
+                has = False
+        elif present and kind == "codex_toml":
+            try:
+                text = Path(path).read_text(encoding="utf-8")
+                has = f"[mcp_servers.{MCP_SERVER_KEY}]" in text
+            except Exception:
+                has = False
+        mcp_regs.append(
+            {
+                "client": c["id"],
+                "path": str(path),
+                "config_present": present,
+                "msx_agents_registered": has,
+            }
+        )
+    report = {
+        "healthy": tools["skill"] == "ok" and tools["mcp_server"] == "ok",
+        "root": str(ROOT),
+        "tools": tools,
+        "skill_links": skill_links,
+        "mcp_registrations": mcp_regs,
+        "detected_clients": [c["id"] for c in detected_clients()],
+    }
+    print(json.dumps(report, indent=2, ensure_ascii=False))
+    return 0 if report["healthy"] else 1
+
+
+def cmd_triage(args: argparse.Namespace) -> int:
+    cmd = [_python(), str(TRIAGE), str(args.path), "--out", str(args.out)]
+    if args.no_disasm:
+        cmd.append("--no-disasm")
+    if args.json_only:
+        cmd.append("--json-only")
+    os.execv(_python(), cmd)
+
+
+def cmd_mcp(_: argparse.Namespace) -> int:
+    os.execv(_python(), [_python(), str(MCP_SERVER)])
+
+
+def cmd_clients(_: argparse.Namespace) -> int:
+    rows = []
+    for c in CLIENTS:
+        rows.append(
+            {
+                "id": c["id"],
+                "label": c["label"],
+                "detected": bool(c.get("always") or (c["marker"] and Path(c["marker"]).exists())),
+                "skill_dir": str(c["skill_dir"]) if c.get("skill_dir") else None,
+                "mcp": str(c["mcp"][1]) if c.get("mcp") else None,
+            }
+        )
+    print(json.dumps(rows, indent=2, ensure_ascii=False))
+    return 0
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="msx-agents",
+        description="MSX ROM/DISK analysis for many LLM agents (skill + MCP), REA-style.",
+    )
+    sub = ap.add_subparsers(dest="cmd", required=True)
+
+    p_setup = sub.add_parser("setup", help="Install skill + register MCP on agents")
+    p_setup.add_argument("--yes", "-y", action="store_true", help="Non-interactive (default)")
+    p_setup.add_argument("--dry-run", action="store_true")
+    p_setup.add_argument("--all-detected", action="store_true", help="All detected clients")
+    p_setup.add_argument(
+        "--client",
+        action="append",
+        default=[],
+        help="Client id (repeatable): cursor, claude_code, codex, ...",
+    )
+    p_setup.add_argument(
+        "--skill-only",
+        action="store_true",
+        help="Install skills only; do not edit MCP configs",
+    )
+    p_setup.set_defaults(func=cmd_setup)
+
+    p_doc = sub.add_parser("doctor", help="Check skill links, MCP, tools")
+    p_doc.set_defaults(func=cmd_doctor)
+
+    p_cli = sub.add_parser("clients", help="List supported / detected clients")
+    p_cli.set_defaults(func=cmd_clients)
+
+    p_tri = sub.add_parser("triage", help="Run msx_triage.py")
+    p_tri.add_argument("path", type=Path)
+    p_tri.add_argument("--out", type=Path, required=True)
+    p_tri.add_argument("--no-disasm", action="store_true")
+    p_tri.add_argument("--json-only", action="store_true")
+    p_tri.set_defaults(func=cmd_triage)
+
+    p_mcp = sub.add_parser("mcp", help="Run MCP stdio server")
+    p_mcp.set_defaults(func=cmd_mcp)
+
+    args = ap.parse_args()
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
